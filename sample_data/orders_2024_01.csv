@@ -1,0 +1,4 @@
+order_id,customer,amount,status
+1001,Ravi Kumar,250.00,delivered
+1002,Priya Sharma,180.50,pending
+1003,Arun Nair,320.00,delivered

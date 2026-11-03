@@ -69,6 +69,26 @@ class AirflowClient:
             ))
         return results
 
+    def _delete(self, path: str) -> None:
+        url = f"{self.base_url}{path}"
+        req = urllib.request.Request(url, headers={
+            "Authorization": self._auth,
+        }, method="DELETE")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+
+    def resolve_run(self, dag_id: str) -> None:
+        """Clear all failed runs for a DAG after the fix is applied.
+
+        On the mock server this calls DELETE /mock/fail/{dag_id}.
+        On a real Airflow server this is a no-op (clearing runs is done via the UI).
+        """
+        try:
+            self._delete(f"/mock/fail/{dag_id}")
+            log.info("Resolved (cleared) failed runs for DAG '%s'", dag_id)
+        except Exception as exc:
+            log.debug("resolve_run skipped (not a mock server or already clear): %s", exc)
+
     def _fetch_log(self, dag_id: str, run_id: str, task_id: str) -> str:
         try:
             path = f"/api/v1/dags/{dag_id}/dagRuns/{run_id}/taskInstances/{task_id}/logs/1"

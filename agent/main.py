@@ -52,7 +52,7 @@ def _save_patch(dag_id: str, error_type: str, patch: str, base_path: str) -> str
     return str(out)
 
 
-def run_triage(run, settings: Settings) -> str:
+def run_triage(run, settings: Settings, client: "AirflowClient | None" = None) -> str:
     """Full triage cycle for one failed DAG run. Returns patch path or 'needs_human'."""
     triage_id = f"{run.dag_id}-{uuid.uuid4().hex[:8]}"
     log.info("[%s] triage started — dag=%s run=%s", triage_id, run.dag_id, run.run_id)
@@ -125,6 +125,10 @@ def run_triage(run, settings: Settings) -> str:
     machine.step()  # complete
     log.info("[%s] DONE — patch: %s", triage_id, patch_path)
 
+    # Clear the failure from Airflow so next poll shows 0 failed runs
+    if client is not None:
+        client.resolve_run(run.dag_id)
+
     notifier.pr_raised(run.dag_id, ctx["error_type"], patch_path, settings)
     return patch_path
 
@@ -151,7 +155,7 @@ def main() -> None:
         for run in new:
             seen_runs.add(run.run_id)
             try:
-                run_triage(run, settings)
+                run_triage(run, settings, client)
             except Exception as exc:
                 log.exception("Unexpected error triaging %s: %s", run.dag_id, exc)
 

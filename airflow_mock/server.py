@@ -1,24 +1,17 @@
 """Minimal Airflow REST API mock.
 
-Runs on http://localhost:8080.
-The agent polls it for failed DAG runs.
-You trigger failures manually via the /mock/* endpoints.
+Trigger a failure: open dag_status.txt and change 'pass' to 'fail', save.
+The agent will detect it within 30s, fix it, and write 'pass' back automatically.
 
 Start:
     .venv/Scripts/python -m airflow_mock.server
-
-Trigger a failure (in another terminal):
-    curl -X POST http://localhost:8088/mock/fail -H "Content-Type: application/json" \
-         -d '{"dag_id":"csv_processor","task_id":"parse_and_count","error":"pandas.errors.ParserError: Error tokenizing data"}'
-
-Reset (mark run as fixed / remove it):
-    curl -X DELETE http://localhost:8088/mock/fail/csv_processor
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -30,9 +23,38 @@ except ImportError:
 
 app = FastAPI(title="Airflow Mock")
 
-# ── in-memory state ───────────────────────────────────────────────────────────
-# dag_id → run record
+# ── in-memory state (kept for the /mock/fail inject endpoint) ─────────────────
 _runs: dict[str, dict] = {}
+
+# ── dag_status.txt ────────────────────────────────────────────────────────────
+# Lives in the project root (one level above airflow_mock/).
+# Write 'fail' and save → agent detects it, fixes it, writes 'pass' back.
+_STATUS_FILE = Path(__file__).parent.parent / "dag_status.txt"
+
+
+def _status_file_run() -> dict | None:
+    """Return a synthetic failed run when dag_status.txt contains 'fail'."""
+    try:
+        content = _STATUS_FILE.read_text().strip().lower()
+    except OSError:
+        return None
+    if content != "fail":
+        return None
+    # File mtime → unique run_id per save, so each new 'fail' save is a fresh failure.
+    mtime = int(_STATUS_FILE.stat().st_mtime)
+    return {
+        "dag_run_id": f"status_run_{mtime}",
+        "dag_id":     "csv_processor",
+        "state":      "failed",
+        "start_date": datetime.now(timezone.utc).isoformat(),
+        "end_date":   datetime.now(timezone.utc).isoformat(),
+        "task_id":    "parse_and_count",
+        "error":      "pandas.errors.ParserError: Error tokenizing data",
+        "traceback":  _default_traceback(
+            "csv_processor", "parse_and_count",
+            "pandas.errors.ParserError: Error tokenizing data",
+        ),
+    }
 
 
 class FailureRequest(BaseModel):
@@ -46,7 +68,6 @@ class FailureRequest(BaseModel):
 
 @app.get("/api/v1/dags/{dag_id}/dagRuns")
 def list_dag_runs(dag_id: str, state: Optional[str] = None):
-    """Returns runs for a DAG, optionally filtered by state."""
     runs = [r for r in _runs.values() if r["dag_id"] == dag_id]
     if state:
         runs = [r for r in runs if r["state"] == state]
@@ -55,8 +76,11 @@ def list_dag_runs(dag_id: str, state: Optional[str] = None):
 
 @app.get("/api/v1/dagRuns")
 def list_all_dag_runs(state: Optional[str] = None):
-    """Returns all runs across all DAGs, optionally filtered by state."""
+    """Returns all runs — from in-memory store AND dag_status.txt."""
     runs = list(_runs.values())
+    file_run = _status_file_run()
+    if file_run and file_run["dag_run_id"] not in _runs:
+        runs.append(file_run)
     if state:
         runs = [r for r in runs if r["state"] == state]
     return {"dag_runs": runs, "total_entries": len(runs)}
@@ -64,7 +88,6 @@ def list_all_dag_runs(state: Optional[str] = None):
 
 @app.get("/api/v1/dags/{dag_id}/dagRuns/{run_id}/taskInstances/{task_id}/logs/1")
 def get_task_log(dag_id: str, run_id: str, task_id: str):
-    """Returns the task log (error traceback) for a specific task instance."""
     run = _runs.get(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -75,34 +98,41 @@ def get_task_log(dag_id: str, run_id: str, task_id: str):
 
 @app.post("/mock/fail", status_code=201)
 def inject_failure(req: FailureRequest):
-    """Inject a failed DAG run. The agent will pick this up on its next poll."""
     run_id = f"manual_run_{req.dag_id}_{uuid.uuid4().hex[:8]}"
     _runs[run_id] = {
         "dag_run_id": run_id,
         "dag_id": req.dag_id,
         "state": "failed",
         "start_date": datetime.now(timezone.utc).isoformat(),
-        "end_date": datetime.now(timezone.utc).isoformat(),
-        "task_id": req.task_id,
-        "error": req.error,
-        "traceback": req.traceback or _default_traceback(req.dag_id, req.task_id, req.error),
+        "end_date":   datetime.now(timezone.utc).isoformat(),
+        "task_id":    req.task_id,
+        "error":      req.error,
+        "traceback":  req.traceback or _default_traceback(req.dag_id, req.task_id, req.error),
     }
     return {"run_id": run_id, "message": f"Failure injected for DAG '{req.dag_id}'"}
 
 
 @app.delete("/mock/fail/{dag_id}")
 def clear_failure(dag_id: str):
-    """Remove all failed runs for a DAG (simulate it being resolved)."""
+    """Remove failed runs for a DAG. Also writes 'pass' back to dag_status.txt."""
     removed = [k for k, v in _runs.items() if v["dag_id"] == dag_id]
     for k in removed:
         del _runs[k]
+    # Write 'pass' back so the file reflects the fix
+    try:
+        _STATUS_FILE.write_text("pass\n")
+    except OSError:
+        pass
     return {"removed": len(removed)}
 
 
 @app.get("/mock/runs")
 def list_mock_runs():
-    """Inspect all current runs (debug helper)."""
-    return {"runs": list(_runs.values())}
+    runs = list(_runs.values())
+    file_run = _status_file_run()
+    if file_run:
+        runs.append(file_run)
+    return {"runs": runs}
 
 
 @app.get("/health")

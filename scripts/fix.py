@@ -55,12 +55,13 @@ ctx = result["fix_context"]
 log.info("Error classified as: %s", ctx["error_type"])
 
 # ── 2. Generate fix ───────────────────────────────────────────────────────────
-log.info("Asking %s to generate a fix...", settings.llm_provider)
-api_key = settings.gemini_api_key if settings.llm_provider == "gemini" else settings.anthropic_api_key
+log.info("Asking %s (%s) to generate a fix...", settings.llm_provider, settings.deepinfra_model)
+api_key, model, base_url = settings.llm_credentials()
 patch = generate_fix(
     ctx, api_key,
     provider=settings.llm_provider,
-    model=settings.gemini_model if settings.llm_provider == "gemini" else "",
+    model=model,
+    base_url=base_url,
 )
 
 # ── 3. Save patch ─────────────────────────────────────────────────────────────

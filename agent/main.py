@@ -6,7 +6,7 @@ Flow
   2. When a failed run is found (first time we see its run_id):
        a. Send you a "DAG failed, working on a fix" email
        b. Run Hamilton diagnosis DAG → classify error → fetch DAG code
-       c. Ask Gemini to generate the unified diff fix
+       c. Ask the LLM to generate the unified diff fix
        d. Save patch to patches/<dag_id>-<error_type>.diff
        e. Send you a "fix ready" email with the patch path
   3. If anything goes wrong → send you a "human needed" escalation email
@@ -96,13 +96,14 @@ def run_triage(run, settings: Settings, client: "AirflowClient | None" = None) -
     machine.step(inputs={"error_type": ctx["error_type"], "dag_code": ctx["dag_code"]})
     log.info("[%s] diagnosed — error_type=%s", triage_id, ctx["error_type"])
 
-    # ── step 3: fix (Gemini) ─────────────────────────────────────────────────
+    # ── step 3: fix (LLM) ───────────────────────────────────────────────────
     try:
-        api_key = settings.gemini_api_key if settings.llm_provider == "gemini" else settings.anthropic_api_key
+        api_key, model, base_url = settings.llm_credentials()
         patch = generate_fix(
             ctx, api_key,
             provider=settings.llm_provider,
-            model=settings.gemini_model if settings.llm_provider == "gemini" else "",
+            model=model,
+            base_url=base_url,
         )
     except Exception as exc:
         log.error("[%s] fix generation failed: %s", triage_id, exc)

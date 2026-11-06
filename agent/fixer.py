@@ -1,8 +1,14 @@
 """LLM generates the fix as a unified diff.
 
-Supports two providers, selected by LLM_PROVIDER in .env:
-  gemini     — Google Gemini via google-generativeai (default; free tier)
-  anthropic  — Anthropic Claude via anthropic SDK
+Providers, selected by LLM_PROVIDER in .env:
+  deepinfra  — open-weight models (DeepSeek, Qwen, GLM, Kimi) over DeepInfra's
+               OpenAI-compatible API  (default)
+  anthropic  — Anthropic Claude via the anthropic SDK
+  gemini     — Google Gemini via google-genai
+
+The "deepinfra" path is not DeepInfra-specific: it is a plain OpenAI
+chat-completions client, so Together, Fireworks, Groq, OpenRouter and a local
+Ollama / vLLM server all work by changing LLM_BASE_URL and DEEPINFRA_MODEL only.
 """
 
 from __future__ import annotations
@@ -97,7 +103,13 @@ _FIX_PROMPTS: dict[str, str] = {
 }
 
 
-def generate_fix(fix_context: dict, api_key: str, provider: str = "gemini", model: str = "") -> str:
+def generate_fix(
+    fix_context: dict,
+    api_key: str,
+    provider: str = "deepinfra",
+    model: str = "",
+    base_url: str = "",
+) -> str:
     """Ask the LLM to fix the DAG. Returns a unified diff string."""
     error_type = fix_context["error_type"]
     dag_code   = fix_context["dag_code"]
@@ -125,8 +137,101 @@ Return ONLY the unified diff. No explanation, no markdown fences.
 """
     if provider == "anthropic":
         return _call_anthropic(api_key, user_msg, model or "claude-sonnet-4-6")
-    else:
+    elif provider == "gemini":
         return _call_gemini(api_key, user_msg, model or "models/gemini-3.5-flash")
+    else:
+        return _call_openai_compatible(
+            api_key,
+            user_msg,
+            model or _DEFAULT_OPEN_MODEL,
+            base_url or _DEFAULT_BASE_URL,
+        )
+
+
+# ── OpenAI-compatible providers (DeepInfra by default) ────────────────────────
+
+_DEFAULT_BASE_URL   = "https://api.deepinfra.com/v1/openai"
+_DEFAULT_OPEN_MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
+
+# Tried in order after the configured model, so a model being renamed or at
+# capacity does not take the agent down mid-incident.
+_OPEN_FALLBACKS = [
+    "deepseek-ai/DeepSeek-V4-Flash-0731",      # $0.06 / $0.18 per 1M
+    "deepseek-ai/DeepSeek-V4.1-Flash-1017",    # $0.098 / $0.294, stronger coder
+    "Qwen/Qwen3.6-35B-A3B",
+]
+
+
+def _call_openai_compatible(api_key: str, user_msg: str, model: str, base_url: str) -> str:
+    """Call any OpenAI-compatible /chat/completions endpoint.
+
+    Unchanged against DeepInfra, Together, Fireworks, Groq, OpenRouter or a
+    local Ollama / vLLM server — only base_url and model differ.
+    """
+    import time
+    import logging
+    from openai import OpenAI
+
+    log = logging.getLogger("triage.fixer")
+    client = OpenAI(api_key=api_key, base_url=base_url or _DEFAULT_BASE_URL)
+
+    models_to_try = [model] + [m for m in _OPEN_FALLBACKS if m != model]
+    last_exc: Exception | None = None
+
+    for m in models_to_try:
+        for wait in (0, 15):          # two attempts per model before moving on
+            if wait:
+                time.sleep(wait)
+            try:
+                resp = client.chat.completions.create(
+                    model=m,
+                    max_tokens=4096,
+                    temperature=0.1,   # writing a patch is not a creative task
+                    messages=[
+                        {"role": "system", "content": _SYSTEM},
+                        {"role": "user",   "content": user_msg},
+                    ],
+                )
+                text = _clean(resp.choices[0].message.content or "")
+                if not text:
+                    raise RuntimeError(f"{m} returned an empty completion")
+                if m != model:
+                    log.info("Used fallback model %s (primary %s unavailable)", m, model)
+                return text
+            except Exception as exc:
+                last_exc = exc
+                err = str(exc).lower()
+                if any(s in err for s in ("429", "503", "overload", "capacity",
+                                          "timeout", "temporarily")):
+                    continue       # transient — retry, then fall through to next model
+                if any(s in err for s in ("404", "not found", "does not exist",
+                                          "unknown model")):
+                    break          # bad model name — skip straight to the next one
+                raise              # auth / quota / malformed request → fail loudly
+        log.warning("Model %s unavailable, trying next...", m)
+
+    raise last_exc if last_exc else RuntimeError("no model produced a completion")
+
+
+def _clean(text: str) -> str:
+    """Strip reasoning blocks and markdown fences that open models often add.
+
+    Several open-weight models emit a <think>...</think> block, or wrap the diff
+    in ```diff fences, despite the system prompt forbidding both. The patch has
+    to be a raw unified diff or `git apply` rejects it.
+    """
+    out = text.strip()
+
+    if "</think>" in out:                       # drop leading reasoning block
+        out = out.split("</think>", 1)[1].strip()
+
+    if out.startswith("```"):                   # unwrap ```diff ... ```
+        lines = out.splitlines()[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        out = "\n".join(lines).strip()
+
+    return out
 
 
 _GEMINI_FALLBACKS = [
@@ -161,7 +266,7 @@ def _call_gemini(api_key: str, user_msg: str, model: str) -> str:
                 )
                 if m != model:
                     log.info("Used fallback model %s (primary %s unavailable)", m, model)
-                return response.text.strip()
+                return _clean(response.text or "")
             except Exception as exc:
                 last_exc = exc
                 err = str(exc)
@@ -184,4 +289,4 @@ def _call_anthropic(api_key: str, user_msg: str, model: str) -> str:
         system=_SYSTEM,
         messages=[{"role": "user", "content": user_msg}],
     )
-    return message.content[0].text.strip()
+    return _clean(message.content[0].text)

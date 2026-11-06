@@ -136,25 +136,29 @@ def run_burr():
 ok &= check("4-step triage run → complete", run_burr)
 
 
-# ── 5. Gemini connectivity (optional — skipped if GEMINI_API_KEY not set) ─────
-print("\n── 5. Gemini API connectivity ──")
+# ── 5. DeepInfra connectivity (optional — skipped if DEEPINFRA_API_KEY not set) ─
+print("\n── 5. DeepInfra / LLM connectivity ──")
 
 import os
-_gemini_key = os.environ.get("GEMINI_API_KEY", "")
+_di_key   = os.environ.get("DEEPINFRA_API_KEY", "")
+_di_model = os.environ.get("DEEPINFRA_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+_di_url   = os.environ.get("LLM_BASE_URL", "https://api.deepinfra.com/v1/openai")
 
-if not _gemini_key or _gemini_key.startswith("sk-ant"):
-    print("  SKIP  GEMINI_API_KEY not set — load .env and re-run to test Gemini")
+if not _di_key:
+    print("  SKIP  DEEPINFRA_API_KEY not set — add it to .env and re-run to test LLM")
 else:
-    def test_gemini():
-        from google import genai
-        client = genai.Client(api_key=_gemini_key)
-        resp = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents="Reply with exactly: OK",
+    def test_deepinfra():
+        from openai import OpenAI
+        client = OpenAI(api_key=_di_key, base_url=_di_url)
+        resp = client.chat.completions.create(
+            model=_di_model,
+            max_tokens=10,
+            messages=[{"role": "user", "content": "Reply with exactly: OK"}],
         )
-        assert resp.text.strip(), "empty response"
-        return resp.text.strip()[:40]
-    ok &= check("gemini-3.8-flash responds", test_gemini)
+        text = resp.choices[0].message.content or ""
+        assert text.strip(), "empty response"
+        return f"{_di_model.split('/')[-1]}: {text.strip()[:40]}"
+    ok &= check(f"DeepInfra {_di_model.split('/')[-1]} responds", test_deepinfra)
 
 
 # ── summary ───────────────────────────────────────────────────────────────────

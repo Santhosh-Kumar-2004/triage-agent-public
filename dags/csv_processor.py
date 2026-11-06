@@ -4,32 +4,19 @@ Airflow DAG: csv_processor
 Reads every file dropped into DATA_DIR, parses it as CSV,
 and writes a row-count summary.
 
-The intentional weak spot: it assumes every file is a CSV.
-If an upstream team drops a PDF or Excel file by mistake,
-pandas raises ParserError and the task fails — triggering
-an Airflow failure email that the triage agent will catch.
+BUG (inject_1): No file-format check — a PDF or Excel file dropped into the
+directory causes pandas to raise ParserError and the whole task fails.
 """
-
 from __future__ import annotations
-
 import os
 from pathlib import Path
-
 import pandas as pd
 from airflow.decorators import dag, task
 from airflow.utils.dates import days_ago
 
 DATA_DIR = Path(os.getenv("TRIAGE_DATA_DIR", "/opt/airflow/sample_data"))
 
-
-@dag(
-    dag_id="csv_processor",
-    schedule="@hourly",
-    start_date=days_ago(1),
-    catchup=False,
-    tags=["etl", "csv"],
-    doc_md=__doc__,
-)
+@dag(dag_id="csv_processor", schedule="@hourly", start_date=days_ago(1), catchup=False, tags=["etl"])
 def csv_processor():
 
     @task()
@@ -41,14 +28,9 @@ def csv_processor():
 
     @task()
     def parse_and_count(file_paths: list[str]) -> dict[str, int]:
-        """Parse each file as CSV and return row counts.
-
-        BUG: no format check — a non-CSV file raises pandas.errors.ParserError.
-        The triage agent will detect this, add a format guard, and open a PR.
-        """
         results = {}
         for path in file_paths:
-            df = pd.read_csv(path)          # <-- fails on PDF / Excel / JSON
+            df = pd.read_csv(path)          # BUG: no extension check
             results[Path(path).name] = len(df)
         return results
 
@@ -60,6 +42,5 @@ def csv_processor():
     files = list_files()
     counts = parse_and_count(files)
     write_summary(counts)
-
 
 csv_processor()
